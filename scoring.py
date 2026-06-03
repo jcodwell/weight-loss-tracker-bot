@@ -25,20 +25,27 @@ Weekly bonus:
 import datetime as dt
 
 POINTS_LOGGED = 10
+POINTS_OVER_CALORIES = -5    # penalty when food log shows over calorie target
 POINTS_MOVE_GOAL = 8
+POINTS_ALL_RINGS = 5         # bonus when all 3 rings (Move + Exercise + Stand) are closed
 POINTS_PER_ACTIVE_MIN = 0.2
 ACTIVE_MIN_CAP = 60          # don't reward grinding past a healthy daily cap
 POINTS_PER_STREAK_DAY = 3
-LATE_FOOD_PENALTY = -5       # deducted when food log is posted after 7 PM EST
+LATE_FOOD_PENALTY = -5       # deducted when no food log posted by 7 PM EST
 
 
-def entry_points(*, logged_food=None, active_minutes=None, move_goal_met=None):
+def entry_points(*, logged_food=None, over_calories=None, active_minutes=None,
+                 move_goal_met=None, all_rings_closed=None):
     """Points earned from a single day's entry."""
     pts = 0
     if logged_food:
         pts += POINTS_LOGGED
+    if over_calories:
+        pts += POINTS_OVER_CALORIES
     if move_goal_met:
         pts += POINTS_MOVE_GOAL
+    if all_rings_closed:
+        pts += POINTS_ALL_RINGS
     if active_minutes:
         capped = min(int(active_minutes), ACTIVE_MIN_CAP)
         pts += capped * POINTS_PER_ACTIVE_MIN
@@ -67,8 +74,10 @@ def total_scores(rows):
             "user_id": r["user_id"],
             "username": r["username"],
             "days_logged": 0,
+            "over_calories_count": 0,
             "active_minutes": 0,
             "move_goals": 0,
+            "all_rings_count": 0,
             "late_penalties": 0,
             "logged_dates": [],
         })
@@ -76,8 +85,10 @@ def total_scores(rows):
         if r.get("logged_food"):
             u["days_logged"] += 1
             u["logged_dates"].append(dt.date.fromisoformat(r["day"]))
+        u["over_calories_count"] += 1 if r.get("over_calories") else 0
         u["active_minutes"] += int(r.get("active_minutes") or 0)
         u["move_goals"] += 1 if r.get("move_goal_met") else 0
+        u["all_rings_count"] += 1 if r.get("all_rings_closed") else 0
         u["late_penalties"] += 1 if r.get("late_penalty") else 0
 
     results = []
@@ -86,7 +97,9 @@ def total_scores(rows):
         capped_active = u["active_minutes"]
         score = (
             u["days_logged"] * POINTS_LOGGED
+            + u["over_calories_count"] * POINTS_OVER_CALORIES
             + u["move_goals"] * POINTS_MOVE_GOAL
+            + u["all_rings_count"] * POINTS_ALL_RINGS
             + capped_active * POINTS_PER_ACTIVE_MIN
             + streak * POINTS_PER_STREAK_DAY
             + u["late_penalties"] * LATE_FOOD_PENALTY

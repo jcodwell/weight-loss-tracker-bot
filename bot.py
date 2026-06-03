@@ -61,26 +61,30 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS entries (
-                user_id        TEXT NOT NULL,
-                username       TEXT NOT NULL,
-                day            TEXT NOT NULL,         -- YYYY-MM-DD
-                logged_food    INTEGER DEFAULT 0,     -- posted a readable food-log screenshot
-                active_minutes INTEGER DEFAULT 0,     -- Apple Fitness exercise minutes
-                move_goal_met  INTEGER DEFAULT 0,     -- Apple Fitness move ring closed
-                late_penalty   INTEGER DEFAULT 0,     -- 1 if food log posted after 7 PM EST
+                user_id          TEXT NOT NULL,
+                username         TEXT NOT NULL,
+                day              TEXT NOT NULL,         -- YYYY-MM-DD
+                logged_food      INTEGER DEFAULT 0,     -- posted a readable food-log screenshot
+                over_calories    INTEGER DEFAULT 0,     -- 1 if user went over calorie target
+                active_minutes   INTEGER DEFAULT 0,     -- Apple Fitness exercise minutes
+                move_goal_met    INTEGER DEFAULT 0,     -- Apple Fitness move ring closed
+                all_rings_closed INTEGER DEFAULT 0,     -- 1 if all 3 rings closed
+                late_penalty     INTEGER DEFAULT 0,     -- 1 if no food log by 7 PM EST
                 PRIMARY KEY (user_id, day)
             )
             """
         )
-        # Migrate older databases missing the late_penalty column
-        try:
-            conn.execute("ALTER TABLE entries ADD COLUMN late_penalty INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Migrate older databases missing new columns
+        for col in ("late_penalty", "over_calories", "all_rings_closed"):
+            try:
+                conn.execute(f"ALTER TABLE entries ADD COLUMN {col} INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
 
 
-def upsert_entry(user_id, username, day, *, logged_food=None,
-                 active_minutes=None, move_goal_met=None, late_penalty=None):
+def upsert_entry(user_id, username, day, *, logged_food=None, over_calories=None,
+                 active_minutes=None, move_goal_met=None, all_rings_closed=None,
+                 late_penalty=None):
     """Merge new fields into a user's row for the day without clobbering the rest."""
     with db() as conn:
         row = conn.execute(
@@ -88,27 +92,35 @@ def upsert_entry(user_id, username, day, *, logged_food=None,
         ).fetchone()
         base = dict(row) if row else {
             "user_id": user_id, "username": username, "day": day,
-            "logged_food": 0, "active_minutes": 0, "move_goal_met": 0,
-            "late_penalty": 0,
+            "logged_food": 0, "over_calories": 0, "active_minutes": 0,
+            "move_goal_met": 0, "all_rings_closed": 0, "late_penalty": 0,
         }
         if logged_food is not None:
             base["logged_food"] = int(logged_food)
+        if over_calories is not None:
+            base["over_calories"] = int(over_calories)
         if active_minutes is not None:
             base["active_minutes"] = max(int(base["active_minutes"]), int(active_minutes))
         if move_goal_met is not None:
             base["move_goal_met"] = int(move_goal_met)
+        if all_rings_closed is not None:
+            base["all_rings_closed"] = int(all_rings_closed)
         if late_penalty is not None:
             base["late_penalty"] = int(late_penalty)
         base["username"] = username
         conn.execute(
             """
-            INSERT INTO entries (user_id, username, day, logged_food, active_minutes, move_goal_met, late_penalty)
-            VALUES (:user_id, :username, :day, :logged_food, :active_minutes, :move_goal_met, :late_penalty)
+            INSERT INTO entries (user_id, username, day, logged_food, over_calories,
+                active_minutes, move_goal_met, all_rings_closed, late_penalty)
+            VALUES (:user_id, :username, :day, :logged_food, :over_calories,
+                :active_minutes, :move_goal_met, :all_rings_closed, :late_penalty)
             ON CONFLICT(user_id, day) DO UPDATE SET
                 username=excluded.username,
                 logged_food=excluded.logged_food,
+                over_calories=excluded.over_calories,
                 active_minutes=excluded.active_minutes,
                 move_goal_met=excluded.move_goal_met,
+                all_rings_closed=excluded.all_rings_closed,
                 late_penalty=excluded.late_penalty
             """,
             base,
@@ -146,8 +158,10 @@ Return ONLY a JSON object, no prose, no markdown fences, with these keys:
 {
   "kind": "food_log" | "apple_fitness" | "unknown",
   "logged_food": true | false,        // true if this is a readable food-log screen showing entries were logged
+  "over_calories": true | false | null, // true if the user exceeded their daily calorie goal/target, false if under, null if not visible
   "active_minutes": integer | null,   // Apple Fitness "Exercise" minutes if visible, else null
   "move_goal_met": true | false | null, // true if the red Move ring is fully closed, else false/null
+  "all_rings_closed": true | false | null, // true if ALL 3 rings (Move red, Exercise green, Stand blue) are fully closed, else false/null
   "readable": true | false            // false if the image is too blurry/cropped to interpret
 }
 If a value isn't present in the image, use null. Do not guess."""
@@ -272,7 +286,10 @@ async def on_message(message: discord.Message):
         results.append(parsed)
 
     # Merge what we read across however many images they posted.
-    payload = {"logged_food": None, "active_minutes": None, "move_goal_met": None}
+    payload = {
+        "logged_food": None, "over_calories": None,
+        "active_minutes": None, "move_goal_met": None, "all_rings_closed": None,
+    }
     readable_any = False
     for p in results:
         if not p.get("readable", False):
@@ -280,12 +297,16 @@ async def on_message(message: discord.Message):
         readable_any = True
         if p.get("kind") == "food_log" and p.get("logged_food"):
             payload["logged_food"] = True
+        if p.get("over_calories") is not None:
+            payload["over_calories"] = bool(p["over_calories"])
         if p.get("active_minutes") is not None:
             payload["active_minutes"] = max(
                 payload["active_minutes"] or 0, int(p["active_minutes"])
             )
         if p.get("move_goal_met") is not None:
             payload["move_goal_met"] = bool(p["move_goal_met"])
+        if p.get("all_rings_closed") is not None:
+            payload["all_rings_closed"] = bool(p["all_rings_closed"])
 
     if not readable_any:
         await message.reply(
@@ -296,10 +317,15 @@ async def on_message(message: discord.Message):
 
     summary = []
     if payload["logged_food"]:
-        summary.append("food logged ✅")
+        if payload["over_calories"]:
+            summary.append("food logged ⚠️ over calories")
+        else:
+            summary.append("food logged ✅")
     if payload["active_minutes"]:
         summary.append(f"{payload['active_minutes']} active min")
-    if payload["move_goal_met"]:
+    if payload["all_rings_closed"]:
+        summary.append("all rings closed 🟢🔴🔵")
+    elif payload["move_goal_met"]:
         summary.append("move goal closed 🔴")
     summary_text = ", ".join(summary) if summary else "nothing trackable found"
 
@@ -330,14 +356,18 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         p = item["payload"]
         pts_added = entry_points(
             logged_food=p["logged_food"],
+            over_calories=p["over_calories"],
             active_minutes=p["active_minutes"],
             move_goal_met=p["move_goal_met"],
+            all_rings_closed=p["all_rings_closed"],
         )
         upsert_entry(
             item["user_id"], item["username"], item["day"],
             logged_food=p["logged_food"],
+            over_calories=p["over_calories"],
             active_minutes=p["active_minutes"],
             move_goal_met=p["move_goal_met"],
+            all_rings_closed=p["all_rings_closed"],
         )
         # Calculate new running total
         rows = all_entries()
@@ -347,8 +377,9 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         )
         channel = bot.get_channel(payload.channel_id)
         msg = await channel.fetch_message(payload.message_id)
+        sign = "+" if pts_added >= 0 else ""
         await msg.edit(
-            content=f"✅ Saved for {item['day']}. **+{pts_added} pts** → total: **{user_total} pts**"
+            content=f"✅ Saved for {item['day']}. **{sign}{pts_added} pts** → total: **{user_total} pts**"
         )
         pending.pop(payload.message_id, None)
     elif str(payload.emoji) == "❌":
