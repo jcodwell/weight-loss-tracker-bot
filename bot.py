@@ -15,6 +15,7 @@ Set up via environment variables (see .env.example / README):
 import os
 import json
 import base64
+import logging
 import sqlite3
 import datetime as dt
 import discord
@@ -28,6 +29,16 @@ from scoring import total_scores, entry_points, LATE_FOOD_PENALTY
 
 EST = ZoneInfo("America/New_York")
 
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("fitness-bot")
+
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -37,7 +48,7 @@ TRACKING_CHANNEL_ID = int(os.environ["TRACKING_CHANNEL_ID"])
 # Haiku is cheap and plenty for reading clear screenshots. Switch to a Sonnet
 # model if your members post low-quality / cluttered images. Check the current
 # model list + pricing at https://docs.claude.com/en/docs/about-claude/models
-VISION_MODEL = "claude-haiku-4-5-latest"
+VISION_MODEL = "claude-haiku-4-5-20251001"
 
 DB_PATH = "fitness.db"
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -167,10 +178,22 @@ Return ONLY a JSON object, no prose, no markdown fences, with these keys:
 If a value isn't present in the image, use null. Do not guess."""
 
 
+def _detect_media_type(data: bytes) -> str:
+    """Detect actual image type from file header bytes."""
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if data[:2] == b'\xff\xd8':
+        return "image/jpeg"
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "image/webp"
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return "image/gif"
+    return "image/png"
+
+
 def image_block_from_bytes(data: bytes, content_type: str):
-    media_type = content_type if content_type in (
-        "image/png", "image/jpeg", "image/gif", "image/webp"
-    ) else "image/png"
+    media_type = _detect_media_type(data)
+    log.info("Encoding image: %d bytes, detected=%s, discord=%s", len(data), media_type, content_type)
     return {
         "type": "image",
         "source": {
@@ -184,7 +207,7 @@ def image_block_from_bytes(data: bytes, content_type: str):
 def parse_screenshot(data: bytes, content_type: str) -> dict:
     resp = client.messages.create(
         model=VISION_MODEL,
-        max_tokens=300,
+        max_tokens=1000,
         messages=[{
             "role": "user",
             "content": [
@@ -193,6 +216,7 @@ def parse_screenshot(data: bytes, content_type: str) -> dict:
             ],
         }],
     )
+    logging.info("Token usage — input: %d, output: %d", resp.usage.input_tokens, resp.usage.output_tokens)
     text = "".join(b.text for b in resp.content if b.type == "text").strip()
     text = text.replace("```json", "").replace("```", "").strip()
     try:
@@ -216,8 +240,8 @@ async def on_ready():
     try:
         await bot.tree.sync()
     except Exception as e:
-        print("Slash sync failed:", e)
-    print(f"Logged in as {bot.user}")
+        log.error("Slash sync failed: %s", e)
+    log.info("Logged in as %s", bot.user)
 
 
 @bot.event
@@ -275,9 +299,10 @@ async def on_message(message: discord.Message):
     for att in images:
         raw = await att.read()
         try:
+            logging.info(f"Parsing image from {message.author.display_name} ({att.filename}, {len(raw)} bytes)")
             parsed = parse_screenshot(raw, att.content_type or "image/png")
         except Exception as e:
-            print(f"Vision API error for {att.filename}: {type(e).__name__}: {e}")
+            log.error("Vision API error for %s: %s: %s", att.filename, type(e).__name__, e)
             await message.reply(
                 "Something went wrong reading that image — try again in a moment.",
                 mention_author=False,
