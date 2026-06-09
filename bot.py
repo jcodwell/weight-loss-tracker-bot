@@ -76,7 +76,7 @@ def init_db():
                 username         TEXT NOT NULL,
                 day              TEXT NOT NULL,         -- YYYY-MM-DD
                 logged_food      INTEGER DEFAULT 0,     -- posted a readable food-log screenshot
-                over_calories    INTEGER DEFAULT 0,     -- 1 if user went over calorie target
+                calories_over    INTEGER DEFAULT 0,     -- how many calories over goal (0 if under)
                 active_minutes   INTEGER DEFAULT 0,     -- Apple Fitness exercise minutes
                 move_goal_met    INTEGER DEFAULT 0,     -- Apple Fitness move ring closed
                 all_rings_closed INTEGER DEFAULT 0,     -- 1 if all 3 rings closed
@@ -85,15 +85,27 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS point_adjustments (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id  TEXT NOT NULL,
+                username TEXT NOT NULL,
+                points   INTEGER NOT NULL,
+                reason   TEXT NOT NULL,
+                created  TEXT NOT NULL          -- ISO timestamp
+            )
+            """
+        )
         # Migrate older databases missing new columns
-        for col in ("late_penalty", "over_calories", "all_rings_closed"):
+        for col in ("late_penalty", "over_calories", "all_rings_closed", "calories_over"):
             try:
                 conn.execute(f"ALTER TABLE entries ADD COLUMN {col} INTEGER DEFAULT 0")
             except sqlite3.OperationalError:
                 pass
 
 
-def upsert_entry(user_id, username, day, *, logged_food=None, over_calories=None,
+def upsert_entry(user_id, username, day, *, logged_food=None, calories_over=None,
                  active_minutes=None, move_goal_met=None, all_rings_closed=None,
                  late_penalty=None):
     """Merge new fields into a user's row for the day without clobbering the rest."""
@@ -103,13 +115,13 @@ def upsert_entry(user_id, username, day, *, logged_food=None, over_calories=None
         ).fetchone()
         base = dict(row) if row else {
             "user_id": user_id, "username": username, "day": day,
-            "logged_food": 0, "over_calories": 0, "active_minutes": 0,
+            "logged_food": 0, "calories_over": 0, "active_minutes": 0,
             "move_goal_met": 0, "all_rings_closed": 0, "late_penalty": 0,
         }
         if logged_food is not None:
             base["logged_food"] = int(logged_food)
-        if over_calories is not None:
-            base["over_calories"] = int(over_calories)
+        if calories_over is not None:
+            base["calories_over"] = max(int(calories_over), 0)
         if active_minutes is not None:
             base["active_minutes"] = max(int(base["active_minutes"]), int(active_minutes))
         if move_goal_met is not None:
@@ -121,14 +133,14 @@ def upsert_entry(user_id, username, day, *, logged_food=None, over_calories=None
         base["username"] = username
         conn.execute(
             """
-            INSERT INTO entries (user_id, username, day, logged_food, over_calories,
+            INSERT INTO entries (user_id, username, day, logged_food, calories_over,
                 active_minutes, move_goal_met, all_rings_closed, late_penalty)
-            VALUES (:user_id, :username, :day, :logged_food, :over_calories,
+            VALUES (:user_id, :username, :day, :logged_food, :calories_over,
                 :active_minutes, :move_goal_met, :all_rings_closed, :late_penalty)
             ON CONFLICT(user_id, day) DO UPDATE SET
                 username=excluded.username,
                 logged_food=excluded.logged_food,
-                over_calories=excluded.over_calories,
+                calories_over=excluded.calories_over,
                 active_minutes=excluded.active_minutes,
                 move_goal_met=excluded.move_goal_met,
                 all_rings_closed=excluded.all_rings_closed,
@@ -148,6 +160,34 @@ def all_entries():
 def clear_all_entries():
     with db() as conn:
         conn.execute("DELETE FROM entries")
+        conn.execute("DELETE FROM point_adjustments")
+
+
+def add_point_adjustment(user_id, username, points, reason):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO point_adjustments (user_id, username, points, reason, created) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, points, reason, dt.datetime.now(EST).isoformat()),
+        )
+
+
+def get_adjustments_total(user_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(points), 0) AS total FROM point_adjustments WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        return row["total"]
+
+
+def all_adjustments():
+    """Return dict of user_id -> total manual adjustment points."""
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT user_id, SUM(points) AS total FROM point_adjustments GROUP BY user_id"
+        ).fetchall()
+        return {r["user_id"]: r["total"] for r in rows}
 
 
 def all_tracked_users():
@@ -169,7 +209,7 @@ Return ONLY a JSON object, no prose, no markdown fences, with these keys:
 {
   "kind": "food_log" | "apple_fitness" | "unknown",
   "logged_food": true | false,        // true if this is a readable food-log screen showing entries were logged
-  "over_calories": true | false | null, // true if the user exceeded their daily calorie goal/target, false if under, null if not visible
+  "calories_over": integer | null,    // if the user exceeded their daily calorie goal, how many calories OVER the goal (e.g. goal 2000, eaten 2350 -> 350). 0 if under goal. null if not visible
   "active_minutes": integer | null,   // Apple Fitness "Exercise" minutes if visible, else null
   "move_goal_met": true | false | null, // true if the red Move ring is fully closed, else false/null
   "all_rings_closed": true | false | null, // true if ALL 3 rings (Move red, Exercise green, Stand blue) are fully closed, else false/null
@@ -264,7 +304,7 @@ async def on_message(message: discord.Message):
         else:
             upsert_entry(user_id, username, day, logged_food=0, active_minutes=0, move_goal_met=0)
             # Determine their rank with ties
-            ranked = total_scores(all_entries())
+            ranked = total_scores(all_entries(), all_adjustments())
             rank = 1
             for i, r in enumerate(ranked):
                 if i > 0 and r["score"] < ranked[i - 1]["score"]:
@@ -312,7 +352,7 @@ async def on_message(message: discord.Message):
 
     # Merge what we read across however many images they posted.
     payload = {
-        "logged_food": None, "over_calories": None,
+        "logged_food": None, "calories_over": None,
         "active_minutes": None, "move_goal_met": None, "all_rings_closed": None,
     }
     readable_any = False
@@ -322,8 +362,8 @@ async def on_message(message: discord.Message):
         readable_any = True
         if p.get("kind") == "food_log" and p.get("logged_food"):
             payload["logged_food"] = True
-        if p.get("over_calories") is not None:
-            payload["over_calories"] = bool(p["over_calories"])
+        if p.get("calories_over") is not None:
+            payload["calories_over"] = max(int(p["calories_over"]), 0)
         if p.get("active_minutes") is not None:
             payload["active_minutes"] = max(
                 payload["active_minutes"] or 0, int(p["active_minutes"])
@@ -342,8 +382,8 @@ async def on_message(message: discord.Message):
 
     summary = []
     if payload["logged_food"]:
-        if payload["over_calories"]:
-            summary.append("food logged ⚠️ over calories")
+        if payload["calories_over"]:
+            summary.append(f"food logged ⚠️ {payload['calories_over']} cal over goal")
         else:
             summary.append("food logged ✅")
     if payload["active_minutes"]:
@@ -381,7 +421,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         p = item["payload"]
         pts_added = entry_points(
             logged_food=p["logged_food"],
-            over_calories=p["over_calories"],
+            calories_over=p["calories_over"],
             active_minutes=p["active_minutes"],
             move_goal_met=p["move_goal_met"],
             all_rings_closed=p["all_rings_closed"],
@@ -389,14 +429,14 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         upsert_entry(
             item["user_id"], item["username"], item["day"],
             logged_food=p["logged_food"],
-            over_calories=p["over_calories"],
+            calories_over=p["calories_over"],
             active_minutes=p["active_minutes"],
             move_goal_met=p["move_goal_met"],
             all_rings_closed=p["all_rings_closed"],
         )
         # Calculate new running total
         rows = all_entries()
-        ranked = total_scores(rows)
+        ranked = total_scores(rows, all_adjustments())
         user_total = next(
             (r["score"] for r in ranked if r["username"] == item["username"]), 0
         )
@@ -445,7 +485,7 @@ async def daily_food_penalty():
 # --------------------------------------------------------------------------- #
 def build_leaderboard_embed():
     rows = all_entries()
-    ranked = total_scores(rows)
+    ranked = total_scores(rows, all_adjustments())
     embed = discord.Embed(
         title="🏆 Standings",
         description="Ranked on consistency + activity.",
@@ -472,15 +512,23 @@ async def leaderboard_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=build_leaderboard_embed())
 
 
-@bot.tree.command(name="reset", description="Announce the winner and reset all scores (moderators/owner only)")
-async def reset_cmd(interaction: discord.Interaction):
+# --------------------------------------------------------------------------- #
+# Mod commands
+# --------------------------------------------------------------------------- #
+
+def _is_mod(interaction: discord.Interaction) -> bool:
     is_owner = interaction.guild and interaction.guild.owner_id == interaction.user.id
     is_mod = interaction.permissions.manage_guild or interaction.permissions.administrator
-    if not (is_owner or is_mod):
+    return is_owner or is_mod
+
+
+@bot.tree.command(name="reset", description="Announce the winner and reset all scores (moderators/owner only)")
+async def reset_cmd(interaction: discord.Interaction):
+    if not _is_mod(interaction):
         await interaction.response.send_message("Only moderators or the server owner can reset scores.", ephemeral=True)
         return
     rows = all_entries()
-    ranked = total_scores(rows)
+    ranked = total_scores(rows, all_adjustments())
     if not ranked:
         await interaction.response.send_message("No scores to reset.")
         return
@@ -503,6 +551,76 @@ async def reset_cmd(interaction: discord.Interaction):
             inline=False,
         )
     await interaction.response.send_message(embed=embed)
+
+
+
+@bot.tree.command(name="adduser", description="Add a user to the competition (moderators/owner only)")
+@app_commands.describe(member="The user to add")
+async def adduser_cmd(interaction: discord.Interaction, member: discord.Member):
+    if not _is_mod(interaction):
+        await interaction.response.send_message("Only moderators or the server owner can use this.", ephemeral=True)
+        return
+    user_id = str(member.id)
+    username = member.display_name
+    day = dt.date.today().isoformat()
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM entries WHERE user_id=?", (user_id,)
+        ).fetchone()
+    if existing:
+        await interaction.response.send_message(f"**{username}** is already on the board.", ephemeral=True)
+        return
+    upsert_entry(user_id, username, day, logged_food=0, active_minutes=0, move_goal_met=0)
+    await interaction.response.send_message(f"**{username}** has been added to the competition!")
+
+
+@bot.tree.command(name="addpoints", description="Add points to a user (moderators/owner only)")
+@app_commands.describe(member="The user to award points to", points="Number of points to add", reason="Reason for the adjustment")
+async def addpoints_cmd(interaction: discord.Interaction, member: discord.Member, points: int, reason: str = "Manual adjustment"):
+    if not _is_mod(interaction):
+        await interaction.response.send_message("Only moderators or the server owner can use this.", ephemeral=True)
+        return
+    user_id = str(member.id)
+    username = member.display_name
+    # Ensure the user is on the board
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM entries WHERE user_id=?", (user_id,)
+        ).fetchone()
+    if not existing:
+        await interaction.response.send_message(f"**{username}** isn't on the board yet. Use `/adduser` first.", ephemeral=True)
+        return
+    add_point_adjustment(user_id, username, points, reason)
+    rows = all_entries()
+    ranked = total_scores(rows, all_adjustments())
+    user_total = next((r["score"] for r in ranked if r["username"] == username), 0)
+    await interaction.response.send_message(
+        f"**+{points} pts** to **{username}** — {reason}\nNew total: **{user_total} pts**"
+    )
+
+
+@bot.tree.command(name="removepoints", description="Remove points from a user (moderators/owner only)")
+@app_commands.describe(member="The user to deduct points from", points="Number of points to remove", reason="Reason for the deduction")
+async def removepoints_cmd(interaction: discord.Interaction, member: discord.Member, points: int, reason: str = "Manual adjustment"):
+    if not _is_mod(interaction):
+        await interaction.response.send_message("Only moderators or the server owner can use this.", ephemeral=True)
+        return
+    user_id = str(member.id)
+    username = member.display_name
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM entries WHERE user_id=?", (user_id,)
+        ).fetchone()
+    if not existing:
+        await interaction.response.send_message(f"**{username}** isn't on the board yet.", ephemeral=True)
+        return
+    add_point_adjustment(user_id, username, -abs(points), reason)
+    rows = all_entries()
+    ranked = total_scores(rows, all_adjustments())
+    user_total = next((r["score"] for r in ranked if r["username"] == username), 0)
+    await interaction.response.send_message(
+        f"**-{abs(points)} pts** from **{username}** — {reason}\nNew total: **{user_total} pts**"
+    )
 
 
 if __name__ == "__main__":

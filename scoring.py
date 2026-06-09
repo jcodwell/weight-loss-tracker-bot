@@ -15,6 +15,7 @@ Design rationale (read before changing):
 
 Points per day:
   logged food (tracked)          -> POINTS_LOGGED
+  per calorie over goal          -> POINTS_PER_CALORIE_OVER  (-0.1 each)
   hit move goal (ring closed)    -> POINTS_MOVE_GOAL
   per active minute              -> POINTS_PER_ACTIVE_MIN  (capped by ACTIVE_MIN_CAP)
 
@@ -25,7 +26,7 @@ Weekly bonus:
 import datetime as dt
 
 POINTS_LOGGED = 10
-POINTS_OVER_CALORIES = -5    # penalty when food log shows over calorie target
+POINTS_PER_CALORIE_OVER = -0.1  # penalty per calorie over goal
 POINTS_MOVE_GOAL = 8
 POINTS_ALL_RINGS = 5         # bonus when all 3 rings (Move + Exercise + Stand) are closed
 POINTS_PER_ACTIVE_MIN = 0.2
@@ -34,14 +35,14 @@ POINTS_PER_STREAK_DAY = 3
 LATE_FOOD_PENALTY = -5       # deducted when no food log posted by 7 PM EST
 
 
-def entry_points(*, logged_food=None, over_calories=None, active_minutes=None,
+def entry_points(*, logged_food=None, calories_over=None, active_minutes=None,
                  move_goal_met=None, all_rings_closed=None):
     """Points earned from a single day's entry."""
     pts = 0
     if logged_food:
         pts += POINTS_LOGGED
-    if over_calories:
-        pts += POINTS_OVER_CALORIES
+    if calories_over:
+        pts += int(calories_over) * POINTS_PER_CALORIE_OVER
     if move_goal_met:
         pts += POINTS_MOVE_GOAL
     if all_rings_closed:
@@ -66,15 +67,18 @@ def _longest_streak(days_sorted):
     return best
 
 
-def total_scores(rows):
-    """rows: list of entry dicts -> ranked list of per-user summaries."""
+def total_scores(rows, adjustments=None):
+    """rows: list of entry dicts -> ranked list of per-user summaries.
+    adjustments: optional dict of user_id -> manual point adjustment total."""
+    if adjustments is None:
+        adjustments = {}
     by_user = {}
     for r in rows:
         u = by_user.setdefault(r["user_id"], {
             "user_id": r["user_id"],
             "username": r["username"],
             "days_logged": 0,
-            "over_calories_count": 0,
+            "total_calories_over": 0,
             "active_minutes": 0,
             "move_goals": 0,
             "all_rings_count": 0,
@@ -85,7 +89,7 @@ def total_scores(rows):
         if r.get("logged_food"):
             u["days_logged"] += 1
             u["logged_dates"].append(dt.date.fromisoformat(r["day"]))
-        u["over_calories_count"] += 1 if r.get("over_calories") else 0
+        u["total_calories_over"] += int(r.get("calories_over") or 0)
         u["active_minutes"] += int(r.get("active_minutes") or 0)
         u["move_goals"] += 1 if r.get("move_goal_met") else 0
         u["all_rings_count"] += 1 if r.get("all_rings_closed") else 0
@@ -95,14 +99,16 @@ def total_scores(rows):
     for u in by_user.values():
         streak = _longest_streak(sorted(u["logged_dates"]))
         capped_active = u["active_minutes"]
+        adjustment = adjustments.get(u["user_id"], 0)
         score = (
             u["days_logged"] * POINTS_LOGGED
-            + u["over_calories_count"] * POINTS_OVER_CALORIES
+            + u["total_calories_over"] * POINTS_PER_CALORIE_OVER
             + u["move_goals"] * POINTS_MOVE_GOAL
             + u["all_rings_count"] * POINTS_ALL_RINGS
             + capped_active * POINTS_PER_ACTIVE_MIN
             + streak * POINTS_PER_STREAK_DAY
             + u["late_penalties"] * LATE_FOOD_PENALTY
+            + adjustment
         )
         results.append({
             "username": u["username"],
