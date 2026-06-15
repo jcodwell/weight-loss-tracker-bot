@@ -457,7 +457,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 # --------------------------------------------------------------------------- #
 # Daily food-log penalty — runs at 7:00 PM EST every day
 # --------------------------------------------------------------------------- #
-@tasks.loop(time=dt.time(hour=19, minute=0, tzinfo=EST))
+@tasks.loop(time=dt.time(hour=0, minute=0, tzinfo=EST))
 async def daily_food_penalty():
     """Penalize tracked users who didn't log food today."""
     today = dt.datetime.now(EST).date().isoformat()
@@ -476,7 +476,7 @@ async def daily_food_penalty():
     if penalised and channel:
         names = ", ".join(f"**{n}**" for n in penalised)
         await channel.send(
-            f"⏰ No food log posted by 7 PM EST — **{LATE_FOOD_PENALTY} pts** penalty for: {names}"
+            f"⏰ No food log posted by 12 AM EST — **{LATE_FOOD_PENALTY} pts** penalty for: {names}"
         )
 
 
